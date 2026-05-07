@@ -1,0 +1,105 @@
+name: rabbit-direct-callback
+on:
+  workflow_dispatch:
+    inputs:
+      correlationId:
+        description: 'Execution ID (correlationId)'
+        required: true
+        default: 'rabbit-test-001'
+      deploymentPlanId:
+        description: 'Deployment Plan ID'
+        required: false
+        default: 'plan-test-001'
+      stepNumber:
+        description: 'Step number'
+        required: false
+        default: '1'
+      environment:
+        description: 'Target environment (INTEGRATION, STAGING, PRODUCTION)'
+        required: false
+        default: 'INTEGRATION'
+      componentName:
+        description: 'Component name'
+        required: false
+        default: 'my-service'
+      version:
+        description: 'Version to deploy'
+        required: false
+        default: '1.0.0'
+      jobStatus:
+        description: 'Job status to report (SUCCESS, FAILURE)'
+        required: false
+        default: 'SUCCESS'
+jobs:
+  publish-to-rabbitmq:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Publish CallbackDeploy to RabbitMQ exchange.callback-deploy-step
+        env:
+          RABBITMQ_MGMT_URL: ${{ secrets.COSMOS_RABBITMQ_MGMT_URL }}
+          RABBITMQ_USER: ${{ secrets.COSMOS_RABBITMQ_USER }}
+          RABBITMQ_PASS: ${{ secrets.COSMOS_RABBITMQ_PASS }}
+        run: |
+          set -e
+          JOB_STATUS="${{ github.event.inputs.jobStatus }}"
+          ROUTING_KEY="${JOB_STATUS}.COSMOS"
+          VHOST="cosmos"
+          EXCHANGE="exchange.callback-deploy-step"
+          TYPE_ID="com.verisure.ps2.cosmos.common.jenkinsevent.event.CallbackDeploy"
+          # Build the CallbackDeploy JSON payload
+          CALLBACK_PAYLOAD=$(printf '{
+            "executionId": "%s",
+            "deploymentPlanId": "%s",
+            "stepNumber": %s,
+            "deployedEnvironment": "%s",
+            "deployedApplication": "%s",
+            "deployedVersion": "%s",
+            "jobStatus": "%s",
+            "jobStatusDescription": "GitHub Actions workflow completed via direct RabbitMQ publish"
+          }' \
+            "${{ github.event.inputs.correlationId }}" \
+            "${{ github.event.inputs.deploymentPlanId }}" \
+            "${{ github.event.inputs.stepNumber }}" \
+            "${{ github.event.inputs.environment }}" \
+            "${{ github.event.inputs.componentName }}" \
+            "${{ github.event.inputs.version }}" \
+            "$JOB_STATUS")
+          # Wrap in RabbitMQ Management API publish format
+          # __TypeId__ header is required for Spring AMQP Jackson2 deserialization
+          PUBLISH_BODY=$(printf '{
+            "properties": {
+              "content_type": "application/json",
+              "delivery_mode": 2,
+              "headers": {
+                "__TypeId__": "%s"
+              }
+            },
+            "routing_key": "%s",
+            "payload": %s,
+            "payload_encoding": "string"
+          }' "$TYPE_ID" "$ROUTING_KEY" "$CALLBACK_PAYLOAD")
+          echo "=== Publishing to RabbitMQ ==="
+          echo "Exchange:    $EXCHANGE"
+          echo "Routing key: $ROUTING_KEY"
+          echo "Payload:     $CALLBACK_PAYLOAD"
+          echo ""
+          # POST to RabbitMQ Management HTTP API
+          ENCODED_VHOST=$(python3 -c "import urllib.parse; print(urllib.parse.quote('$VHOST', safe=''))")
+          ENCODED_EXCHANGE=$(python3 -c "import urllib.parse; print(urllib.parse.quote('$EXCHANGE', safe=''))")
+          PUBLISH_URL="${RABBITMQ_MGMT_URL}/api/exchanges/${ENCODED_VHOST}/${ENCODED_EXCHANGE}/publish"
+          echo "=== Calling: $PUBLISH_URL"
+          HTTP_STATUS=$(curl -s -o /tmp/rabbit_response.txt -w "%{http_code}" \
+            -X POST \
+            -H "Content-Type: application/json" \
+            -u "${RABBITMQ_USER}:${RABBITMQ_PASS}" \
+            -d "$PUBLISH_BODY" \
+            "$PUBLISH_URL")
+          echo "HTTP status: $HTTP_STATUS"
+          echo "Response:    $(cat /tmp/rabbit_response.txt)"
+          if [ "$HTTP_STATUS" != "200" ]; then
+            echo "ERROR: Failed to publish to RabbitMQ (HTTP $HTTP_STATUS)"
+            exit 1
+          fi
+          ROUTED=$(cat /tmp/rabbit_response.txt | python3 -c "import sys,json; d=json.load(sys.stdin); print('routed=' + str(d.get('routed', False)))")
+          echo "$ROUTED"
+          echo "=== Message published successfully to exchange.callback-deploy-step with routing key $ROUTING_KEY ==="
