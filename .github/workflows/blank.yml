@@ -4,12 +4,14 @@ on:
     branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
+  # Triggered by cosmos-github-dispatcher via workflow_dispatch API.
+  # Also allows manual trigger from the GitHub Actions web UI → Run workflow button.
   workflow_dispatch:
     inputs:
       correlationId:
-        description: 'Correlation / execution ID'
+        description: 'Correlation / execution ID (maps to executionId in CallbackDeploy)'
         required: false
-        default: 'test'
+        default: 'manual-test'
       componentName:
         description: 'Component name to deploy'
         required: false
@@ -34,13 +36,20 @@ on:
         description: 'Queue type'
         required: false
         default: 'GITHUB_KUBERNETES'
+
 jobs:
   build:
+    name: Build & print dispatch inputs
     runs-on: ubuntu-latest
+    # Make job status available to the callback step
+    outputs:
+      job_status: ${{ job.status }}
     steps:
       - uses: actions/checkout@v4
+
       - name: Print dispatch inputs
         run: |
+          echo "=== Dispatch Inputs received from cosmos-github-dispatcher ==="
           echo "correlationId = ${{ github.event.inputs.correlationId }}"
           echo "componentName = ${{ github.event.inputs.componentName }}"
           echo "version       = ${{ github.event.inputs.version }}"
@@ -48,5 +57,59 @@ jobs:
           echo "stepNumber    = ${{ github.event.inputs.stepNumber }}"
           echo "componentType = ${{ github.event.inputs.componentType }}"
           echo "queueType     = ${{ github.event.inputs.queueType }}"
+          echo "================================================================"
+
       - name: Run a one-line script
         run: echo Hello, world!
+
+      # ── Callback to cosmos-github-dispatcher ──────────────────────────────
+      # Sends a CallbackDeploy (JSON) with HMAC-SHA256 signature to the
+      # webhook endpoint exposed via Cloudflare Tunnel.
+      # Runs always (success AND failure) so cosmos always gets notified.
+      - name: Notify cosmos-github-dispatcher (webhook callback)
+        if: always()
+        env:
+          COSMOS_CALLBACK_URL: ${{ secrets.COSMOS_CALLBACK_URL }}
+          COSMOS_WEBHOOK_SECRET: ${{ secrets.COSMOS_WEBHOOK_SECRET }}
+        run: |
+          # Determine jobStatus for CallbackDeploy
+          if [ "${{ job.status }}" = "success" ]; then
+            JOB_STATUS="SUCCESS"
+          else
+            JOB_STATUS="FAILURE"
+          fi
+
+          STEP_NUMBER=${{ github.event.inputs.stepNumber || '1' }}
+
+          # Build the CallbackDeploy JSON payload
+          PAYLOAD=$(printf '{"executionId":"%s","deploymentPlanId":"%s","stepNumber":%s,"deployedEnvironment":"%s","deployedApplication":"%s","deployedVersion":"%s","jobStatus":"%s","jobStatusDescription":"GitHub Actions workflow completed"}' \
+            "${{ github.event.inputs.correlationId }}" \
+            "${{ github.event.inputs.correlationId }}" \
+            "$STEP_NUMBER" \
+            "${{ github.event.inputs.environment || 'INTEGRATION' }}" \
+            "${{ github.event.inputs.componentName || 'test-component' }}" \
+            "${{ github.event.inputs.version || '1.0.0' }}" \
+            "$JOB_STATUS")
+
+          echo "Payload: $PAYLOAD"
+
+          # Generate HMAC-SHA256 signature
+          SIGNATURE="sha256=$(echo -n "$PAYLOAD" | openssl dgst -sha256 -hmac "$COSMOS_WEBHOOK_SECRET" | awk '{print $2}')"
+
+          echo "Sending callback to $COSMOS_CALLBACK_URL"
+
+          # POST to webhook endpoint
+          HTTP_STATUS=$(curl -s -o /tmp/cb_response.txt -w "%{http_code}" \
+            -X POST \
+            -H "Content-Type: application/json" \
+            -H "X-Hub-Signature-256: $SIGNATURE" \
+            -H "X-GitHub-Event: workflow_dispatch" \
+            -d "$PAYLOAD" \
+            "$COSMOS_CALLBACK_URL/cosmos-github-dispatcher/webhook/callback")
+
+          echo "HTTP status: $HTTP_STATUS"
+          cat /tmp/cb_response.txt
+
+          if [ "$HTTP_STATUS" != "200" ]; then
+            echo "WARNING: Callback returned $HTTP_STATUS — cosmos may not have been notified"
+          fi
