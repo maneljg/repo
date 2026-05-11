@@ -1,4 +1,4 @@
-﻿name: CI
+name: CI
 on:
   push:
     branches: [ "main" ]
@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       correlationId:
-        description: 'Correlation / execution ID (maps to executionId in CallbackDeploy)'
+        description: 'Correlation / execution ID (maps to executionid in CallbackDeploy)'
         required: false
         default: 'manual-test'
       componentName:
@@ -36,41 +36,42 @@ on:
         description: 'Queue type'
         required: false
         default: 'GITHUB_KUBERNETES'
+      step-callback-url:
+        description: 'Full URL to POST the CallbackDeploy result to (e.g. https://xxx.ngrok.io/github-dispatcher/webhook/callback)'
+        required: false
+        default: ''
 
 jobs:
   build:
     name: Build & print dispatch inputs
     runs-on: ubuntu-latest
-    # Make job status available to the callback step
-    outputs:
-      job_status: ${{ job.status }}
     steps:
       - uses: actions/checkout@v4
 
       - name: Print dispatch inputs
         run: |
           echo "=== Dispatch Inputs received from cosmos-github-dispatcher ==="
-          echo "correlationId = ${{ github.event.inputs.correlationId }}"
-          echo "componentName = ${{ github.event.inputs.componentName }}"
-          echo "version       = ${{ github.event.inputs.version }}"
-          echo "environment   = ${{ github.event.inputs.environment }}"
-          echo "stepNumber    = ${{ github.event.inputs.stepNumber }}"
-          echo "componentType = ${{ github.event.inputs.componentType }}"
-          echo "queueType     = ${{ github.event.inputs.queueType }}"
+          echo "correlationId     = ${{ github.event.inputs.correlationId }}"
+          echo "componentName     = ${{ github.event.inputs.componentName }}"
+          echo "version           = ${{ github.event.inputs.version }}"
+          echo "environment       = ${{ github.event.inputs.environment }}"
+          echo "stepNumber        = ${{ github.event.inputs.stepNumber }}"
+          echo "componentType     = ${{ github.event.inputs.componentType }}"
+          echo "queueType         = ${{ github.event.inputs.queueType }}"
+          echo "step-callback-url = ${{ github.event.inputs.step-callback-url }}"
           echo "================================================================"
 
       - name: Run a one-line script
         run: echo Hello, world!
 
       # ── Callback to cosmos-github-dispatcher ──────────────────────────────
-      # Sends a CallbackDeploy (JSON) with HMAC-SHA256 signature to the
-      # webhook endpoint exposed via Cloudflare Tunnel.
+      # Sends a CallbackDeploy JSON to the step-callback-url input.
+      # Authentication via SD-APIKEY header (stored as a GitHub Actions secret).
       # Runs always (success AND failure) so cosmos always gets notified.
       - name: Notify cosmos-github-dispatcher (webhook callback)
-        if: always()
+        if: always() && github.event.inputs.step-callback-url != ''
         env:
-          COSMOS_CALLBACK_URL: ${{ secrets.COSMOS_CALLBACK_URL }}
-          COSMOS_WEBHOOK_SECRET: ${{ secrets.COSMOS_WEBHOOK_SECRET }}
+          COSMOS_SD_APIKEY: ${{ secrets.COSMOS_SD_APIKEY }}
         run: |
           # Determine jobStatus for CallbackDeploy
           if [ "${{ job.status }}" = "success" ]; then
@@ -81,9 +82,9 @@ jobs:
 
           STEP_NUMBER=${{ github.event.inputs.stepNumber || '1' }}
 
-          # Build the CallbackDeploy JSON payload
-          PAYLOAD=$(printf '{"executionId":"%s","deploymentPlanId":"%s","stepNumber":%s,"deployedEnvironment":"%s","deployedApplication":"%s","deployedVersion":"%s","jobStatus":"%s","jobStatusDescription":"GitHub Actions workflow completed"}' \
-            "${{ github.event.inputs.correlationId }}" \
+          # Build the CallbackDeploy JSON payload.
+          # Field names must match @JsonProperty values in CallbackDeploy (all lowercase).
+          PAYLOAD=$(printf '{"executionid":"%s","stepnumber":%s,"deployedenvironment":"%s","deployedapplication":"%s","deployedversion":"%s","jobstatus":"%s","jobstatusdescription":"GitHub Actions workflow completed"}' \
             "${{ github.event.inputs.correlationId }}" \
             "$STEP_NUMBER" \
             "${{ github.event.inputs.environment || 'INTEGRATION' }}" \
@@ -92,24 +93,19 @@ jobs:
             "$JOB_STATUS")
 
           echo "Payload: $PAYLOAD"
+          echo "Sending callback to ${{ github.event.inputs.step-callback-url }}"
 
-          # Generate HMAC-SHA256 signature
-          SIGNATURE="sha256=$(echo -n "$PAYLOAD" | openssl dgst -sha256 -hmac "$COSMOS_WEBHOOK_SECRET" | awk '{print $2}')"
-
-          echo "Sending callback to $COSMOS_CALLBACK_URL"
-
-          # POST to webhook endpoint
           HTTP_STATUS=$(curl -s -o /tmp/cb_response.txt -w "%{http_code}" \
             -X POST \
             -H "Content-Type: application/json" \
-            -H "X-Hub-Signature-256: $SIGNATURE" \
-            -H "X-GitHub-Event: workflow_dispatch" \
+            -H "SD-APIKEY: $COSMOS_SD_APIKEY" \
             -d "$PAYLOAD" \
-            "$COSMOS_CALLBACK_URL/cosmos-github-dispatcher/webhook/callback")
+            "${{ github.event.inputs.step-callback-url }}")
 
           echo "HTTP status: $HTTP_STATUS"
           cat /tmp/cb_response.txt
 
           if [ "$HTTP_STATUS" != "200" ]; then
             echo "WARNING: Callback returned $HTTP_STATUS — cosmos may not have been notified"
+            exit 1
           fi
